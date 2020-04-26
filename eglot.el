@@ -797,6 +797,11 @@ INTERACTIVE is t if called interactively."
   "Hook run after server is successfully initialized.
 Each function is passed the server as an argument")
 
+(defvar eglot--server-created-hook      ; for the test suite.
+  '()
+  "Hook run each time a server instance is created.
+Each function is passed the server as an argument")
+
 (defun eglot--connect (managed-major-mode project class contact)
   "Connect to MANAGED-MAJOR-MODE, PROJECT, CLASS and CONTACT.
 This docstring appeases checkdoc, that's all."
@@ -851,6 +856,7 @@ This docstring appeases checkdoc, that's all."
     (setf (eglot--project-nickname server) nickname)
     (setf (eglot--major-mode server) managed-major-mode)
     (setf (eglot--inferior-process server) autostart-inferior-process)
+    (run-hook-with-args 'eglot--server-created-hook server)
     ;; Now start the handshake.  To honour `eglot-sync-connect'
     ;; maybe-sync-maybe-async semantics we use `jsonrpc-async-request'
     ;; and mimic most of `jsonrpc-request'.
