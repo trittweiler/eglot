@@ -797,6 +797,11 @@ INTERACTIVE is t if called interactively."
   "Hook run after server is successfully initialized.
 Each function is passed the server as an argument")
 
+(defvar eglot--server-created-hook      ; for the test suite.
+  '()
+  "Hook run each time a server instance is created.
+Each function is passed the server as an argument")
+
 (defun eglot--connect (managed-major-mode project class contact)
   "Connect to MANAGED-MAJOR-MODE, PROJECT, CLASS and CONTACT.
 This docstring appeases checkdoc, that's all."
@@ -851,6 +856,7 @@ This docstring appeases checkdoc, that's all."
     (setf (eglot--project-nickname server) nickname)
     (setf (eglot--major-mode server) managed-major-mode)
     (setf (eglot--inferior-process server) autostart-inferior-process)
+    (run-hook-with-args 'eglot--server-created-hook server)
     ;; Now start the handshake.  To honour `eglot-sync-connect'
     ;; maybe-sync-maybe-async semantics we use `jsonrpc-async-request'
     ;; and mimic most of `jsonrpc-request'.
@@ -1109,6 +1115,7 @@ Doubles as an indicator of snippet support."
                  (list (plist-get markup :value)
                        (pcase (plist-get markup :kind)
                          ("markdown" 'gfm-view-mode)
+                         ("plaintext" 'text-mode)
                          (_ major-mode))))))
     (with-temp-buffer
       (insert string)
@@ -1832,8 +1839,8 @@ Calls REPORT-FN maybe if server publishes diagnostics in time."
        (maphash (lambda (_uri buf) (kill-buffer buf)) eglot--temp-location-buffers)
        (clrhash eglot--temp-location-buffers))))
 
-(defun eglot--xref-make (name uri range)
-  "Like `xref-make' but with LSP's NAME, URI and RANGE.
+(defun eglot--xref-make-match (name uri range)
+  "Like `xref-make-match' but with LSP's NAME, URI and RANGE.
 Try to visit the target file for a richer summary line."
   (pcase-let*
       ((file (eglot--uri-to-path uri))
@@ -1848,8 +1855,9 @@ Try to visit the target file for a richer summary line."
                                 (hi-end (- (min (point-at-eol) end) bol)))
                      (add-face-text-property hi-beg hi-end 'highlight
                                              t substring)
-                     (list substring (1+ (current-line)) (eglot-current-column))))))
-       (`(,summary ,line ,column)
+                     (list substring (1+ (current-line)) (eglot-current-column)
+                           (- end beg))))))
+       (`(,summary ,line ,column ,length)
         (cond
          (visiting (with-current-buffer visiting (funcall collect)))
          ((file-readable-p file) (with-current-buffer
@@ -1858,9 +1866,12 @@ Try to visit the target file for a richer summary line."
                                    (insert-file-contents file)
                                    (funcall collect)))
          (t ;; fall back to the "dumb strategy"
-          (let ((start (cl-getf range :start)))
-            (list name (1+ (cl-getf start :line)) (cl-getf start :character)))))))
-    (xref-make summary (xref-make-file-location file line column))))
+          (let* ((start (cl-getf range :start))
+                 (line (1+ (cl-getf start :line)))
+                 (start-pos (cl-getf start :character))
+                 (end-pos (cl-getf (cl-getf range :end) :character)))
+            (list name line start-pos (- end-pos start-pos)))))))
+    (xref-make-match summary (xref-make-file-location file line column) length)))
 
 (cl-defmethod xref-backend-identifier-completion-table ((_backend (eql eglot)))
   (eglot--error "cannot (yet) provide reliable completion table for LSP symbols"))
@@ -1891,7 +1902,7 @@ Try to visit the target file for a richer summary line."
     (eglot--collecting-xrefs (collect)
       (mapc
        (eglot--lambda ((Location) uri range)
-         (collect (eglot--xref-make (symbol-at-point) uri range)))
+         (collect (eglot--xref-make-match (symbol-at-point) uri range)))
        (if (vectorp response) response (list response))))))
 
 (cl-defun eglot--lsp-xref-helper (method &key extra-params capability )
@@ -1934,7 +1945,7 @@ Try to visit the target file for a richer summary line."
       (mapc
        (eglot--lambda ((SymbolInformation) name location)
          (eglot--dbind ((Location) uri range) location
-           (collect (eglot--xref-make name uri range))))
+           (collect (eglot--xref-make-match name uri range))))
        (jsonrpc-request (eglot--current-server-or-lose)
                         :workspace/symbol
                         `(:query ,pattern))))))
@@ -2230,7 +2241,7 @@ Respects `max-mini-window-height' (which see)."
   #'eglot-doc-too-large-for-echo-area
   "If non-nil, put \"hover\" documentation in separate `*eglot-help*' buffer.
 If nil, use whatever `eldoc-message-function' decides (usually
-the echo area).  If t, use `*eglot-help; unconditionally.  If a
+the echo area).  If t, use `*eglot-help*' unconditionally.  If a
 function, it is called with the docstring to display and should a
 boolean producing one of the two previous values."
   :type '(choice (const :tag "Never use `*eglot-help*'" nil)
@@ -2251,11 +2262,13 @@ potentially rename EGLOT's help buffer."
           (and eglot-put-doc-in-help-buffer
                (funcall eglot-put-doc-in-help-buffer string)))
       (with-current-buffer (eglot--help-buffer)
-        (rename-buffer (format "*eglot-help for %s*" hint))
-        (let ((inhibit-read-only t))
-          (erase-buffer)
-          (insert string)
-          (goto-char (point-min))
+        (let ((inhibit-read-only t)
+              (name (format "*eglot-help for %s*" hint)))
+          (unless (string= name (buffer-name))
+            (rename-buffer (format "*eglot-help for %s*" hint))
+            (erase-buffer)
+            (insert string)
+            (goto-char (point-min)))
           (if eglot-auto-display-help-buffer
               (display-buffer (current-buffer))
             (unless (get-buffer-window (current-buffer))
