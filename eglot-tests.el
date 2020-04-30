@@ -69,7 +69,8 @@ then restored."
 
 (defun eglot--call-with-fixture (fixture fn)
   "Helper for `eglot--with-fixture'.  Run FN under FIXTURE."
-  (let* ((fixture-directory (make-temp-file "eglot--fixture" t))
+  (let* ((fixture-directory (file-name-as-directory
+                             (make-temp-file "eglot--fixture" t)))
          (default-directory fixture-directory)
          file-specs created-files
          syms-to-restore
@@ -110,19 +111,14 @@ then restored."
                 ;; shut down such that any pending data has been
                 ;; consumed and is available in the process
                 ;; buffers.
-                (let ((buffers (delq nil (list
-                                          ;; FIXME: Accessing "internal" symbol here.
-                                          (process-buffer (jsonrpc--process server))
-                                          (jsonrpc-stderr-buffer server)
-                                          (jsonrpc-events-buffer server)))))
+                (when-let ((buffer (eglot--events-buffer server)))
                   (cond (noninteractive
-                         (dolist (buffer buffers)
-                           (eglot--message "%s:" (buffer-name buffer))
-                           (princ (with-current-buffer buffer (buffer-string))
-                                  'external-debugging-output)))
+                         ;; In batch mode, dump the contents.
+                         (eglot--message "%s:" (buffer-name buffer))
+                         (princ (with-current-buffer buffer (buffer-string))
+                                'external-debugging-output))
                         (t
-                         (eglot--message "Preserved for inspection: %s"
-                                         (mapconcat #'buffer-name buffers ", "))))))))
+                         (eglot--message "Preserved for inspection: %s" buffer)))))))
         (eglot--cleanup-after-test fixture-directory created-files syms-to-restore)))))
 
 (defun eglot--cleanup-after-test (fixture-directory created-files syms-to-restore)
@@ -188,8 +184,8 @@ then restored."
                                client-notifications
                                client-replies))
            (advice-add
-            #'jsonrpc--log-event :before
-            (lambda (_proc message &optional type)
+            #'jsonrpc-log-event :before
+            (lambda (_proc message type)
               (cl-destructuring-bind (&key method id _error &allow-other-keys)
                   message
                 (let ((req-p (and method id))
@@ -212,7 +208,7 @@ then restored."
                                       `(push message ,client-replies)))))))))
             '((name . ,log-event-ad-sym)))
            ,@body)
-       (advice-remove #'jsonrpc--log-event ',log-event-ad-sym))))
+       (advice-remove #'jsonrpc-log-event ',log-event-ad-sym))))
 
 (cl-defmacro eglot--wait-for ((events-sym &optional (timeout 1) message) args &body body)
   "Spin until FN match in EVENTS-SYM, flush events after it.
@@ -264,6 +260,121 @@ Pass TIMEOUT to `eglot--with-timeout'."
 
 
 ;;; Unit tests
+
+(ert-deftest events-buffer-connect-by-pipe ()
+  "Check output of inferior process in events buffer, connected via pipe."
+  (skip-unless (executable-find "pyls"))
+  (eglot--with-fixture
+      `(("project" . (("python.py" . "bla")))
+        ,@eglot--tests--python-mode-bindings)
+    ;; Make pyls verbose so it writes some output during its startup.
+    (let ((eglot-server-programs '((python-mode . ("pyls" "-v")))))
+      (with-current-buffer
+          (eglot--find-file-noselect "project/python.py")
+        (should (eglot--tests-connect))
+        (let ((events (with-current-buffer
+                          (window-buffer (call-interactively 'eglot-events-buffer))
+                        (buffer-string))))
+          (should (string-match-p "^\\[jsonrpc\\] (:jsonrpc" events))
+          (should (string-match-p "^\\[inferior\\] .* Starting PythonLanguageServer" events)))))))
+
+(ert-deftest events-buffer-connect-by-socket ()
+  "Check output of inferior process in events buffer, connected via socket."
+  (skip-unless (executable-find "solargraph"))
+  (eglot--with-fixture
+      '(("project" . (("ruby.rb" . "bla"))))
+    ;; Hard code to use :autoport here for the case where the default
+    ;; might change as solargraph also supports stdio based
+    ;; communication. The point of this test is to exercise connecting
+    ;; to an inferior process via socket, though.
+    (let ((eglot-server-programs '((ruby-mode . ("solargraph" "socket" "--port" :autoport)))))
+      (with-current-buffer
+          (eglot--find-file-noselect "project/ruby.rb")
+        (should (eglot--tests-connect))
+        (let ((events (with-current-buffer
+                          (window-buffer (call-interactively 'eglot-events-buffer))
+                        (buffer-string))))
+          (should (string-match-p "^\\[jsonrpc\\] (:jsonrpc" events))
+          (should (string-match-p "^\\[inferior\\] Solargraph is listening" events)))))))
+
+(ert-deftest events-buffer-server-does-not-start ()
+  "Check output of inferior process in events buffer when it fails to start."
+  (skip-unless (executable-find "pyls"))
+  (eglot--with-fixture
+      `(("project" . (("python.py" . "bla")))
+        ,@eglot--tests--python-mode-bindings)
+    (let ((eglot-server-programs '((python-mode . ("pyls" "-this_option_does_not_exist")))))
+      (with-current-buffer
+          (eglot--find-file-noselect "project/python.py")
+        (let ((err (should-error (eglot--tests-connect))))
+          (should (string-match-p "Server died" (cadr err)))
+          (let* ((events-buffer (eglot--events-buffer "EGLOT (project/python-mode)"))
+                 (events (with-current-buffer events-buffer (buffer-string))))
+            (should (string-match-p "^\\[inferior\\] usage:" events))))))))
+
+(ert-deftest eglot-events-buffer-size ()
+  "Test `eglot-events-buffer-size' taking effect."
+  (skip-unless (executable-find "pyls"))
+  (let ((eglot-server-programs '((python-mode . ("pyls" "-v"))))
+        (eglot-events-buffer-size 200))
+    (eglot--with-fixture
+        `(("project" . (("python.py" . "bla")))
+          ,@eglot--tests--python-mode-bindings)
+      (with-current-buffer
+          (eglot--find-file-noselect "project/python.py")
+        (should (eglot--tests-connect))
+        (let ((events (with-current-buffer
+                          (window-buffer (call-interactively 'eglot-events-buffer))
+                        (buffer-string))))
+          ;; The first client request should long have been erased
+          ;; from the events buffer due to the small
+          ;; `eglot-events-buffer-size'.
+          (should-not (string-match-p
+                       "^\\[jsonrpc\\] (:jsonrpc .* :id 1 :method \"initialize\""
+                       events)))))))
+
+
+(ert-deftest events-buffer-test-line-buffering ()
+  "Check that only whole lines are inserted into the events buffer."
+  (skip-unless (executable-find "bash"))
+  (eglot--with-fixture
+      `(("inferior.sh" .
+         "#!/bin/bash
+trap 'echo -n \"starting a line\" >&2' SIGUSR1
+trap 'echo \" and finishing it off.\" >&2' SIGUSR2
+
+while true; do read; done"))
+    (chmod "inferior.sh" 0500) ; u+rx
+    (let* ((fake-name "EGLOT (events-buffer-test-line-buffering)")
+           (events-buffer (eglot--events-buffer fake-name))
+           (command `("bash" ,(concat default-directory "inferior.sh"))))
+      (pcase-let ((`(,inferior . ,stderr-pipe)
+                   (eglot--start-inferior-connect-by-pipe fake-name command)))
+        (unwind-protect
+            (progn
+              (should-not (string-match-p "^\\[inferior\\] starting a line"
+                                          (with-current-buffer events-buffer
+                                            (buffer-string))))
+              (signal-process inferior 'sigusr1)
+              ;; The inferior process should have writeten into the
+              ;; hidden buffer associated with its stderr:
+              (should (accept-process-output stderr-pipe 0.5 nil t))
+              ;; But nothing should have carried over to the events buffer
+              ;; because the output was not delimited by a newline.
+              (should-not (string-match-p "^\\[inferior\\] starting a line"
+                                          (with-current-buffer events-buffer
+                                            (buffer-string))))
+              ;; The SIGUSR2 will make the inferior process print a
+              ;; newline and now, the whole output line should appear
+              ;; in the events buffer.
+              (signal-process inferior 'sigusr2)
+              (should (accept-process-output stderr-pipe 0.5 nil t))
+              (should (string-match-p "^\\[inferior\\] starting a line and finishing it off"
+                                      (with-current-buffer events-buffer
+                                        (buffer-string)))))
+          (delete-process inferior)
+          (delete-process stderr-pipe)
+          (kill-buffer events-buffer))))))
 
 (ert-deftest eclipse-connect ()
   "Connect to eclipse.jdt.ls server."

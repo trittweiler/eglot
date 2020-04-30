@@ -67,7 +67,8 @@
 (require 'xref)
 (eval-when-compile
   (require 'subr-x))
-(require 'jsonrpc)
+(require 'jsonrpc "./jsonrpc.el")
+
 (require 'filenotify)
 (require 'ert)
 (require 'array)
@@ -602,7 +603,9 @@ SERVER.  ."
         (jsonrpc-notify server :exit nil))
     ;; Now ask jsonrpc.el to shut down the server.
     (jsonrpc-shutdown server (not preserve-buffers))
-    (unless preserve-buffers (kill-buffer (jsonrpc-events-buffer server)))))
+    (unless preserve-buffers
+      (when-let ((events-buffer (eglot--events-buffer server)))
+        (kill-buffer events-buffer)))))
 
 (defun eglot--on-shutdown (server)
   "Called by jsonrpc.el when SERVER is already dead."
@@ -618,6 +621,9 @@ SERVER.  ."
   ;; Kill any autostarted inferior processes
   (when-let (proc (eglot--inferior-process server))
     (delete-process proc))
+
+  ;; TODO: copy over any left over from inferior process output buffers
+
   ;; Sever the project/server relationship for `server'
   (setf (gethash (eglot--project server) eglot--servers-by-project)
         (delq server
@@ -778,12 +784,14 @@ INTERACTIVE is t if called interactively."
 (defun eglot-events-buffer (server)
   "Display events buffer for SERVER."
   (interactive (list (eglot--current-server-or-lose)))
-  (display-buffer (jsonrpc-events-buffer server)))
+  (let ((buffer (eglot--events-buffer server)))
+    (if buffer
+        (display-buffer buffer)
+      ;; This can happen if `eglot-events-buffer-size' is 0.
+      (error "No events buffer exists"))))
 
-(defun eglot-stderr-buffer (server)
-  "Display stderr buffer for SERVER."
-  (interactive (list (eglot--current-server-or-lose)))
-  (display-buffer (jsonrpc-stderr-buffer server)))
+;; TODO: deprecate
+(defalias 'eglot-stderr-buffer 'eglot-events-buffer)
 
 (defun eglot-forget-pending-continuations (server)
   "Forget pending requests for SERVER."
@@ -810,6 +818,7 @@ Each function is passed the server as an argument")
 This docstring appeases checkdoc, that's all."
   (let* ((default-directory (car (project-roots project)))
          (nickname (file-name-base (directory-file-name default-directory)))
+         ;; TODO: get rid of "EGLOT" here and add it instead to the `get-buffer-create's
          (readable-name (format "EGLOT (%s/%s)" nickname managed-major-mode))
          autostart-inferior-process
          (contact (if (functionp contact) (funcall contact) contact))
@@ -824,30 +833,28 @@ This docstring appeases checkdoc, that's all."
                 ((and (stringp (car contact)) (memq :autoport contact))
                  `(:process ,(lambda ()
                                (pcase-let ((`(,connection . ,inferior)
-                                            (eglot--inferior-bootstrap
+                                            (eglot--start-inferior-connect-by-socket
                                              readable-name
                                              contact)))
                                  (setq autostart-inferior-process inferior)
                                  connection))))
                 ((stringp (car contact))
-                 `(:process
-                   ,(lambda ()
-                      (let ((default-directory default-directory))
-                        (make-process
-                         :name readable-name
-                         :command contact
-                         :connection-type 'pipe
-                         :coding 'utf-8-emacs-unix
-                         :noquery t
-                         :stderr (get-buffer-create
-                                  (format "*%s stderr*" readable-name)))))))))
+                 `(:process ,(lambda ()
+                               (pcase-let ((`(,json-stream . ,log-stream)
+                                            (eglot--start-inferior-connect-by-pipe
+                                             readable-name
+                                             contact)))
+                                 ;; TODO: this is set to the stderr output stream, not the
+                                 ;; actual inferior process. Need to rename
+                                 ;; `eglot--inferior-process'? But to what...
+                                 (setq autostart-inferior-process log-stream)
+                                 json-stream))))))
          (spread (lambda (fn) (lambda (server method params)
                                 (apply fn server method (append params nil)))))
          (server
           (apply
            #'make-instance class
            :name readable-name
-           :events-buffer-scrollback-size eglot-events-buffer-size
            :notification-dispatcher (funcall spread #'eglot-handle-notification)
            :request-dispatcher (funcall spread #'eglot-handle-request)
            :on-shutdown #'eglot--on-shutdown
@@ -942,7 +949,7 @@ in project `%s'."
           (quit (jsonrpc-shutdown server) (setq cancelled 'quit)))
       (setq tag nil))))
 
-(defun eglot--inferior-bootstrap (name contact &optional connect-args)
+(defun eglot--start-inferior-connect-by-socket (name contact &optional connect-args)
   "Use CONTACT to start a server, then connect to it.
 Return a cons of two process objects (CONNECTION . INFERIOR).
 Name both based on NAME.
@@ -956,15 +963,22 @@ CONNECT-ARGS are passed as additional arguments to
                           (process-contact port-probe :service)
                         (delete-process port-probe)))
          inferior connection)
+    (eglot--log-event 'eglot name "Starting inferior process: %S" contact)
     (unwind-protect
         (progn
           (setq inferior
                 (make-process
                  :name (format "autostart-inferior-%s" name)
-                 :stderr (format "*%s stderr*" name)
+                 :buffer (get-buffer-create
+                          ;; Hide the buffer.
+                          (format " *%s %s*" name (car contact)))
+                 :stderr nil          ; stdout/stderr into same buffer
+                 :filter #'eglot--inferior-process-log-filter
+                 :coding 'utf-8-emacs-unix
                  :noquery t
                  :command (cl-subst
                            (format "%s" port-number) :autoport contact)))
+          (process-put inferior 'eglot--lsp-server-name name)
           (setq connection
                 (cl-loop
                  repeat 10 for i from 1
@@ -990,6 +1004,121 @@ CONNECT-ARGS are passed as additional arguments to
                                (format " started with %s"
                                        (process-command inferior))
                              "!")))))))
+
+(defun eglot--start-inferior-connect-by-pipe (name contact)
+  (eglot--log-event 'eglot name "Starting inferior process: %S" contact)
+  (let* ((log-stream
+          (make-pipe-process :name (format "pipe %s:stderr" (car contact))
+                             :buffer (get-buffer-create
+                                      ;; Hide the buffer
+                                      (format " *%s %s:stderr*" name (car contact)))
+                             :filter #'eglot--inferior-process-log-filter
+                             :coding 'utf-8-emacs-unix
+                             :noquery t))
+         (json-stream
+          (make-process :name (format "%s" (car contact))
+                        :buffer (get-buffer-create
+                                 ;; Hide the buffer
+                                 (format " *%s %s:stdout*" name (car contact)))
+                        :command contact
+                        :connection-type 'pipe
+                        :coding 'utf-8-emacs-unix
+                        :noquery t
+                        :stderr log-stream)))
+    (process-put log-stream 'eglot--lsp-server-name name)
+    ;; Wait a tiny bit for the inferior process to write its startup
+    ;; messages. So they appear in the events buffer before the client
+    ;; request.
+    (accept-process-output log-stream 0.25)
+    (cons json-stream log-stream)))
+
+(defun eglot--inferior-process-log-filter (proc string)
+  (let ((proc-buffer (process-buffer proc)))
+    (when (buffer-live-p proc-buffer)
+      (with-current-buffer proc-buffer
+        (let* ((inhibit-read-only t))
+          ;; We use the process buffer to hold the output state so we can
+          ;; move whole lines to the actually user-visible events buffer.
+          ;; This is to prevent intermingling of the process' output with
+          ;; jsonrpc events across line boundaries.
+          (save-excursion
+            (goto-char (process-mark proc))
+            (insert string)
+            (set-marker (process-mark proc) (point))
+            ;; Note: we go through the name so the events buffer can
+            ;; get created even when the connection instance is still
+            ;; being initialized.
+            (when-let* ((server-name (process-get proc 'eglot--lsp-server-name))
+                        (last-newline
+                         ;; The coding-system is *-unix so looking for ?\n is kosher.
+                         (cond ((looking-at "\n") (point))
+                               ((search-backward "\n" nil t) (point)))))
+              (eglot--log-event 'inferior server-name
+                                ;; Note this moves the process-mark implicitly.
+                                "%s"
+                                (delete-and-extract-region (point-min)
+                                                           ;; Extract the newline, too
+                                                           (1+ last-newline))))))))))
+
+
+;;; Events Buffer
+;;;
+
+(cl-defmethod jsonrpc-log-event ((conn eglot-lsp-server) message type)
+  (eglot--log-event 'jsonrpc conn "%s" (jsonrpc-message-to-string message type)))
+
+(defun eglot--events-buffer (connection-or-name)
+  "Return the events buffer of CONNECTION-OR-NAME, or create it.
+
+The function returns nil if `eglot-events-buffer-size' is 0."
+  (when (or (null eglot-events-buffer-size)
+            (cl-plusp eglot-events-buffer-size))
+    (let* ((name (format "*%s events*"
+                         (cond ((stringp connection-or-name)
+                                connection-or-name)
+                               (t
+                                (jsonrpc-name connection-or-name)))))
+           (probe (get-buffer name)))
+      (if (buffer-live-p probe)
+          probe
+        (let ((buffer (get-buffer-create name)))
+          (with-current-buffer buffer
+            (buffer-disable-undo)
+            (read-only-mode t)
+            (setq-local show-trailing-whitespace nil))
+          buffer)))))
+
+(defun eglot--log-event (context connection-or-name format &rest args)
+  "Insert a message into the events buffer.
+
+Each line in the result of (apply #'format FORMAT ARGS) is
+prefixed with CONTEXT and then inserted into the events buffer
+belonging to CONNECTION-OR-NAME."
+  (when-let ((events-buffer (eglot--events-buffer connection-or-name)))
+    (let* ((string (apply #'format format args))
+           (last-char (aref string (1- (length string))))
+           (lines
+            (nbutlast (split-string string "\n")
+                      ;; Prevent a trailing \n to result in an extra
+                      ;; empty line.
+                      (if (char-equal ?\n last-char) 1 0)))
+           (contents
+            (mapconcat (lambda (line) (format "[%s] %s\n" context line))
+                       lines "")))
+      (with-current-buffer events-buffer
+        (let* ((inhibit-read-only t))
+          (goto-char (point-max))
+          (prog1
+              (insert-before-markers contents) ; TODO: why before markers?
+            ;; Trim the buffer if it's too large
+            (when-let ((max eglot-events-buffer-size))
+              (when (and (cl-plusp max) (> (buffer-size) max))
+                (save-excursion
+                  (goto-char (- (buffer-size) max))
+                  (end-of-line)
+                  (delete-region (point-min)
+                                 (min (1+ (point)) ; also delete the newline
+                                      (point-max))))))))))))
 
 
 ;;; Helpers (move these to API?)
@@ -1411,8 +1540,7 @@ Uses THING, FACE, DEFS and PREPEND."
      (when nick
        `(":" ,(eglot--mode-line-props
                nick 'eglot-mode-line
-               '((C-mouse-1 eglot-stderr-buffer "go to stderr buffer")
-                 (mouse-1 eglot-events-buffer "go to events buffer")
+               '((mouse-1 eglot-events-buffer "go to events buffer")
                  (mouse-2 eglot-shutdown      "quit server")
                  (mouse-3 eglot-reconnect     "reconnect to server")))
          ,@(when last-error

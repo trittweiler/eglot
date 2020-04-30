@@ -7,7 +7,7 @@ SELECTOR=t
 
 LOAD_PATH=-L .
 
-ELFILES := eglot.el eglot-tests.el
+ELFILES := jsonrpc.el eglot.el eglot-tests.el
 ELCFILES := $(ELFILES:.el=.elc)
 
 ELPADEPS ?=--eval '(package-initialize)'			\

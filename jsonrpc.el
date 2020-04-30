@@ -44,6 +44,8 @@
 (require 'pcase)
 (require 'ert) ; to escape a `condition-case-unless-debug'
 
+(eval-when-compile
+  (message "---- Loading modified jsonrpc.el ----"))
 
 ;;; Public API
 ;;;
@@ -74,7 +76,7 @@
     :accessor jsonrpc--events-buffer
     :documentation "A buffer pretty-printing the JSONRPC events")
    (-events-buffer-scrollback-size
-    :initarg :events-buffer-scrollback-size
+    :initarg :events-buffer-scrollback-size                 ; TODO: deprecate
     :accessor jsonrpc--events-buffer-scrollback-size
     :documentation "Max size of events buffer.  0 disables, nil means infinite.")
    (-deferred-actions
@@ -129,6 +131,26 @@ immediately."
   (:method (_s _what)   ;; by default all connections are ready
            t))
 
+(cl-defgeneric jsonrpc-log-event (connection message type)
+  "Log a JSONRPC-related event.
+CONNECTION is the `jsonrpc-connection' where the event has arisen
+through.  MESSAGE is a JSON-like plist.  TYPE is one of the
+following symbols: 'client, 'server, 'internal. These denote
+where the message has originated from. An example for an internal
+message is when a timeout has occured.
+
+FIXME: document MESSAGE more: method id error
+
+The function `jsonrpc-message-to-string' is available to turn
+MESSAGE into a string.")
+
+
+
+;; TODO: deprecation warning
+(cl-defmethod jsonrpc-log-event ((conn jsonrpc-connection) message type)
+  (let ((msg (jsonrpc-message-to-string message type)))
+    (jsonrpc--insert-into-events-buffer conn msg)))
+
 
 ;;; Convenience
 ;;;
@@ -163,7 +185,7 @@ dispatcher in CONNECTION."
   (cl-destructuring-bind (&key method id error params result _jsonrpc)
       message
     (let (continuations)
-      (jsonrpc--log-event connection message 'server)
+      (jsonrpc-log-event connection message 'server)
       (setf (jsonrpc-last-error connection) error)
       (cond
        (;; A remote request
@@ -340,7 +362,7 @@ ignored."
 (defclass jsonrpc-process-connection (jsonrpc-connection)
   ((-process
     :initarg :process :accessor jsonrpc--process
-    :documentation "Process object wrapped by the this connection.")
+    :documentation "A `process' yielding JSONRPC messages.")
    (-expected-bytes
     :accessor jsonrpc--expected-bytes
     :documentation "How many bytes declared by server.")
@@ -365,21 +387,29 @@ connection object, called when the process dies .")
 (cl-defmethod initialize-instance ((conn jsonrpc-process-connection) slots)
   (cl-call-next-method)
   (let* ((proc (plist-get slots :process))
-         (proc (if (functionp proc) (funcall proc) proc))
-         (buffer (get-buffer-create (format "*%s output*" (process-name proc))))
-         (stderr (get-buffer-create (format "*%s stderr*" (process-name proc)))))
-    (setf (jsonrpc--process conn) proc)
-    (set-process-buffer proc buffer)
-    (process-put proc 'jsonrpc-stderr stderr)
+         (proc (if (functionp proc) (funcall proc) proc)))
+    ;; Do this conditionally so user has a chance to specify the
+    ;; buffer's name themselves.
+    (unless (process-buffer proc)
+      (let ((output-buffer (get-buffer-create
+                            (format " *%s output*" (process-name proc)))))
+        (set-process-buffer proc output-buffer)))
+    ;; We do this for backwards compatibility.
+    (when-let ((stderr-buffer (get-buffer (format "*%s stderr*" (process-name proc)))))
+      ;; TODO: deprecation warning
+      (with-current-buffer stderr-buffer
+        (buffer-disable-undo))
+      (process-put proc 'jsonrpc-stderr stderr-buffer))
     (set-process-filter proc #'jsonrpc--process-filter)
     (set-process-sentinel proc #'jsonrpc--process-sentinel)
     (with-current-buffer (process-buffer proc)
       (buffer-disable-undo)
       (set-marker (process-mark proc) (point-min))
-      (let ((inhibit-read-only t)) (erase-buffer) (read-only-mode t) proc))
-    (with-current-buffer stderr
-      (buffer-disable-undo))
-    (process-put proc 'jsonrpc-connection conn)))
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (read-only-mode t)))
+    (process-put proc 'jsonrpc-connection conn)
+    (setf (jsonrpc--process conn) proc)))
 
 (cl-defmethod jsonrpc-connection-send ((connection jsonrpc-process-connection)
                                        &rest args
@@ -406,7 +436,7 @@ connection object, called when the process dies .")
      (cl-loop for (header . value) in headers
               concat (concat header ": " value "\r\n") into header-section
               finally return (format "%s\r\n%s" header-section json)))
-    (jsonrpc--log-event connection message 'client)))
+    (jsonrpc-log-event connection message 'client)))
 
 (defun jsonrpc-process-type (conn)
   "Return the `process-type' of JSONRPC connection CONN."
@@ -431,11 +461,14 @@ With optional CLEANUP, kill any associated buffers."
        (accept-process-output nil 0.1))
     (when cleanup
       (kill-buffer (process-buffer (jsonrpc--process conn)))
-      (kill-buffer (jsonrpc-stderr-buffer conn)))))
+      (when-let ((stderr (jsonrpc-stderr-buffer conn)))
+        (kill-buffer stderr)))))
 
+;; TODO: deprecate
 (defun jsonrpc-stderr-buffer (conn)
   "Get CONN's standard error buffer, if any."
   (process-get (jsonrpc--process conn) 'jsonrpc-stderr))
+
 
 
 ;;; Private stuff
@@ -651,8 +684,9 @@ TIMEOUT is nil)."
 
 (defun jsonrpc--debug (server format &rest args)
   "Debug message for SERVER with FORMAT and ARGS."
-  (jsonrpc--log-event
-   server (if (stringp format)`(:message ,(format format args)) format)))
+  (jsonrpc-log-event
+   server (if (stringp format)`(:message ,(format format args)) format)
+   'internal))
 
 (defun jsonrpc--warn (format &rest args)
   "Warning message with FORMAT and ARGS."
@@ -662,44 +696,45 @@ TIMEOUT is nil)."
                      (apply #'format format args)
                      :warning)))
 
-(defun jsonrpc--log-event (connection message &optional type)
-  "Log a JSONRPC-related event.
-CONNECTION is the current connection.  MESSAGE is a JSON-like
-plist.  TYPE is a symbol saying if this is a client or server
-originated."
+(defun jsonrpc--insert-into-events-buffer (connection string)
   (let ((max (jsonrpc--events-buffer-scrollback-size connection)))
     (when (or (null max) (cl-plusp max))
       (with-current-buffer (jsonrpc-events-buffer connection)
-        (cl-destructuring-bind (&key method id error &allow-other-keys) message
-          (let* ((inhibit-read-only t)
-                 (subtype (cond ((and method id)       'request)
-                                (method                'notification)
-                                (id                    'reply)
-                                (t                     'message)))
-                 (type
-                  (concat (format "%s" (or type 'internal))
-                          (if type
-                              (format "-%s" subtype)))))
-            (goto-char (point-max))
-            (prog1
-                (let ((msg (format "%s%s%s %s:\n%s\n"
-                                   type
-                                   (if id (format " (id:%s)" id) "")
-                                   (if error " ERROR" "")
-                                   (current-time-string)
-                                   (pp-to-string message))))
-                  (when error
-                    (setq msg (propertize msg 'face 'error)))
-                  (insert-before-markers msg))
-              ;; Trim the buffer if it's too large
-              (when max
-                (save-excursion
-                  (goto-char (point-min))
-                  (while (> (buffer-size) max)
-                    (delete-region (point) (progn (forward-line 1)
-                                                  (forward-sexp 1)
-                                                  (forward-line 2)
-                                                  (point)))))))))))))
+        (let* ((inhibit-read-only t))
+          (goto-char (point-max))
+          (prog1
+              (insert-before-markers string)
+            ;; Trim the buffer if it's too large
+            (when max
+              (save-excursion
+                (goto-char (point-min))
+                (while (> (buffer-size) max)
+                  (delete-region (point) (progn (forward-line 1)
+                                                (forward-sexp 1)
+                                                (forward-line 2)
+                                                (point))))))))))))
+
+;;; TODO: Should we really provide and export this? Or move to eglot.el?
+(defun jsonrpc-message-to-string (message type)
+  "FIXME."
+  (cl-destructuring-bind (&key method id error &allow-other-keys) message
+    (let* ((subtype (cond ((and method id)       'request)
+                          (method                'notification)
+                          (id                    'reply)
+                          (t                     'message)))
+           (type
+            (concat (format "%s" (or type 'internal))
+                    (if type
+                        (format "-%s" subtype)))))
+      (let ((msg (format "%s%s%s %s:\n%s"
+                         type
+                         (if id (format " (id:%s)" id) "")
+                         (if error " ERROR" "")
+                         (current-time-string)
+                         (pp-to-string message))))
+        (when error
+          (setq msg (propertize msg 'face 'error)))
+        msg))))
 
 (provide 'jsonrpc)
 ;;; jsonrpc.el ends here
